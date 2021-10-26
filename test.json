@@ -1,0 +1,11 @@
+{
+  "source": {
+    "uri": "https://github.com/alphagov/gsp",
+    "organization": "alphagov",
+    "repository": "gsp",
+    "branch": "master",
+    "approvers": ["samcrang", "paroxp", "blairboy362"],
+    "required_approval_count": 1,
+    "github_api_token": "notarealtoken"
+  }
+}

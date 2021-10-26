@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+
+set -eu
+
+payload="/original_input"
+
+# allow nested stringified json (useful when using credential store to pass values)
+cat | jq 'walk(if type == "string" then . as $raw | try fromjson catch $raw else . end)' > ${payload} <&0
+
+organization=$(jq --raw-output '.source.organization // ""' < ${payload})
+repository=$(jq --raw-output '.source.repository // ""' < ${payload})
+github_api_token=$(jq --raw-output '.source.github_api_token // ""' < ${payload})
+required_approval_count=$(jq --raw-output '(.source.required_approval_count // 0)' < ${payload})
+approvers=$(jq --raw-output '(.source.approvers // [])[]' < ${payload} | sort)
+
+if [ -z "${organization}" ]; then
+  echo "invalid source configuration: missing required 'organization'" >&2
+  exit 1
+fi
+
+if [ -z "${repository}" ]; then
+  echo "invalid source configuration: missing required 'repository'" >&2
+  exit 1
+fi
+
+if [ -z "${github_api_token}" ]; then
+  echo "invalid source configuration: missing required 'github_api_token'" >&2
+  exit 1
+fi
+
+if [ -z "${approvers}" ]; then
+  echo "invalid source configuration: missing required 'approvers'" >&2
+  exit 1
+fi
+
+if [ "${required_approval_count}" -eq 0 ]; then
+  echo "warning: approval count set to zero." >&2
+  echo "If you don't require this you probably should be using the regular git-resource" >&2
+fi
+
+/opt/resource/in.origin "$@" < ${payload} > /original_output
+
+exec 3>&1 # make stdout available as fd 3 for the result
+exec 1>&2 # redirect all output to stderr for logging
+
+echo Approvers: $approvers
+
+function build_query() {
+{
+  local org=$1
+  local repo=$2
+  local merge_commit_sha=$3
+
+  cat <<EOF
+query {
+  repository(owner: \"${org}\", name: \"${repo}\") {
+    object(oid: \"${merge_commit_sha}\") {
+      ... on Commit {
+        oid
+        associatedPullRequests(first: 1) {
+          nodes {
+            author {
+              login
+            }
+            commits(last: 1) {
+              nodes {
+                commit {
+                  signature {
+                    ... on GpgSignature {
+                      signer {
+                        login
+                      }
+                      keyId
+                      isValid
+                    }
+                  }
+                }
+              }
+            }
+            reviews(first: 5, states: APPROVED) {
+              nodes {
+                author {
+                  login
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+EOF
+} | tr -d '\n'
+}
+
+destination=$1
+cd "${destination}"
+head_ref=$(git rev-parse HEAD)
+echo HEAD ref: $head_ref
+
+api_response=$( \
+  curl --header 'Content-Type: application/json' \
+        --header "Authorization: bearer ${github_api_token}" \
+        --data "{ \"query\": \"$(build_query "${organization}" "${repository}" "${head_ref}")\"}" \
+        "https://api.github.com/graphql" \
+)
+
+echo API response: $api_response
+pr_author=$(echo $api_response | jq --raw-output ".data.repository.object.associatedPullRequests.nodes[].author.login")
+echo PR author: $pr_author
+commit_signature_author=$(echo $api_response | jq --raw-output ".data.repository.object.associatedPullRequests.nodes[].commits.nodes[0].commit.signature.signer.login")
+echo Commit signature author: $commit_signature_author
+commit_signature_valid_string=$(echo $api_response | jq --raw-output ".data.repository.object.associatedPullRequests.nodes[].commits.nodes[0].commit.signature.isValid")
+echo Commit signature valid: $commit_signature_valid_string
+
+if [ "${commit_signature_valid_string}" != "true" ] ; then
+  keyId=$(echo $api_response | jq --raw-output ".data.repository.object.associatedPullRequests.nodes[].commits.nodes[0].commit.signature.keyId")
+  echo "ERROR: GitHub reports that the git signature was not valid.  This can happen for a number of reasons, but you can check:"
+  echo "- has the GPG key ${keyId} been added to ${commit_signature_author}'s GitHub account?"
+  echo "- has the GPG key ${keyId} expired?"
+  echo "You can read more about checking commit verification status here: https://help.github.com/en/articles/checking-your-commit-and-tag-signature-verification-status"
+  exit 1
+fi
+
+approvals=$(echo "${api_response}" | jq --raw-output .data.repository.object.associatedPullRequests.nodes[].reviews.nodes[].author.login | grep -v "${commit_signature_author}" | sort)
+echo Approvals: $approvals
+
+
+valid_approval_count=$(\
+  comm -12 \
+    <(echo "${approvers}") \
+    <(echo "${approvals}") \
+  | grep -v "${pr_author}" \
+  | wc -l \
+)
+
+if [[ "${valid_approval_count}" -lt "${required_approval_count}" ]]; then
+  echo "[FAILURE] You have ${valid_approval_count} GitHub approval(s) and need ${required_approval_count} or more."
+  echo "[FAILURE]"
+  echo "[FAILURE] The following people could provide the required approvals:"
+
+  comm -23 \
+    <(echo "${approvers}") \
+    <(echo "${approvals}") \
+  | grep -v "${commit_signature_author}" \
+  | grep -v "${pr_author}" \
+  | xargs -I {} echo "[FAILURE]   - {}"
+
+  exit 1
+fi
+
+echo "[SUCCESS] You have ${valid_approval_count} GitHub approval(s) and needed ${required_approval_count} or more."
+
+cat /original_output >&3
