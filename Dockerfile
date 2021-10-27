@@ -1,4 +1,5 @@
-FROM concourse/git-resource:1.1.1
+ARG base_image=concourse/git-resource:1.14.5-alpine
+FROM ${base_image} as base-image
 
 RUN apk update
 
