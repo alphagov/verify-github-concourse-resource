@@ -1,5 +1,9 @@
 # verify-github-concourse-resource
 
+>**GOV.UK Verify has closed**
+>
+>This repository is out of date and has been archived
+
 GitHub resource for Concourse that enforces a minimum number of GitHub approvals. This relies heavily on the [Concourse `git-resource`](https://github.com/concourse/git-resource).
 
 This has been taken from the now archived [GSP repository](https://github.com/alphagov/gsp/tree/master/components/concourse-github-resource) and updated. It's heavily used in Verify and needs maintaining.
